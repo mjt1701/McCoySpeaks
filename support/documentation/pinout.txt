@@ -1,0 +1,39 @@
+
+
+         Here’s a text-based wiring diagram for ATtiny85 + DFPlayer Mini + Button + LED:
+
+ATtiny85 Pinout (DIP-8):
+         +---\/---+
+  PB5  1 |        | 8  VCC
+  PB3  2 |        | 7  PB2
+  PB4  3 |        | 6  PB1
+  GND  4 |        | 5  PB0
+         +-------+
+
+
+Connections:
+
+VCC (pin 8) → 3.3V or 5V power
+GND (pin 4) → Ground
+DFPlayer Mini:
+
+VCC → 3.3V or 5V power
+GND → Ground
+RX → ATtiny85 TX (PB3, pin 2) via 1k–2.2k resistor
+TX → ATtiny85 RX (PB0, pin 5)
+BUSY → ATtiny85 PB4 (pin 3)
+Button:
+
+One side → ATtiny85 PB2 (pin 7)
+Other side → GND
+LED (with resistor, e.g., 220Ω):
+
+Anode (+) → ATtiny85 PB1 (pin 6)
+Cathode (–) → GND
+Speaker/Amplifier:
+
+Connect to DFPlayer Mini speaker outputs
+Decoupling Capacitors:
+
+100nF ceramic: ATtiny85 VCC ↔ GND (close to chip)
+10μF electrolytic: Near amplifier power
