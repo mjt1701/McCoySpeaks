@@ -2,6 +2,8 @@
 #include <SoftwareSerial.h>
 #include <EEPROM.h>
 
+// todo make system ask sdcard for number of tracks.
+
 // ---------- Pin definitions ----------
 #define BUTTON_PIN 2    // PB2 (pin 7)
 #define LED_PIN 1       // PB1 (pin 6)
@@ -15,7 +17,8 @@
 #define LONG_PRESS_MS 1500
 #define VOLUME_STEP 5
 #define VOLUME_TIMEOUT 3000
-#define INTRO_TRACK 26
+#define INTRO_TRACK 1
+#define MAX_VOLUME 30
 
 // ---------- DFPlayer Serial ----------
 SoftwareSerial dfSerial(DFPLAYER_TX, DFPLAYER_RX); // TX, RX
@@ -35,11 +38,10 @@ State currentState = STATE_INTRO;
 bool buttonPressed = false;
 unsigned long buttonPressStart = 0;
 unsigned long lastVolumeAction = 0;
+unsigned long playStart = 0; // For playback timing
 byte volume = 5;
-int currentBrightness = 0;
-int targetBrightness = 0;
-const int eepromAddress = 1;  // EEPROM location to store volume
-
+const int eepromAddress = 1; // EEPROM location to store volume
+bool seededRandom = false;
 
 // ---------- DFPlayer Command Helper ----------
 void sendCommand(uint8_t cmd, uint16_t param)
@@ -62,24 +64,22 @@ void sendCommand(uint8_t cmd, uint16_t param)
     dfSerial.write(packet[i]);
 }
 
-// ---------- SET VOLUME  ----------
 void setVolume(byte vol)
 {
-  volume = constrain(vol, 0, 30);
+  volume = constrain(vol, 0, MAX_VOLUME);
   sendCommand(0x06, volume);
 }
 
-// ---------- SAVE VOLUME VALUE ----------
-void rememberVolume(byte currentVolume) {
- // if (EEPROM.read(eepromAddress) != currentVolume) {
-    EEPROM.update(eepromAddress, currentVolume);
- // }
+void rememberVolume(byte v)
+{
+  EEPROM.update(eepromAddress, v);
 }
 
-// ---------- READ SAVED VOLUME VALUE ----------
-byte readSavedVolume() {
-    byte v = EEPROM.read(eepromAddress);
-  if (v > 30) v = 15;   // sanity check / default
+byte readSavedVolume()
+{
+  byte v = EEPROM.read(eepromAddress);
+  if (v > MAX_VOLUME)
+    v = MAX_VOLUME / 2; // default
   return v;
 }
 
@@ -90,54 +90,126 @@ void playTrack(uint16_t track)
 
 void playRandomClip()
 {
-  int track = random(1, 144); //  143 clips
+  int track = random(1, 144); // 143 clips
   playTrack(track);
 }
 
-// ---------- Volume State Timeout ----------
-void handleVolumeTimeout()
+// ---------- Button Handling ----------
+bool updateButton()
 {
-  if (currentState == STATE_VOLUME)
+  bool pressed = (digitalRead(BUTTON_PIN) == LOW);
+  unsigned long now = millis();
+
+  static bool lastReading = HIGH;
+  static unsigned long lastDebounce = 0;
+
+  if (pressed != lastReading)
   {
-    if (millis() - lastVolumeAction > VOLUME_TIMEOUT) // todo watch this variable
-     {rememberVolume(volume);
- 
-    currentState = STATE_IDLE;
-     }
+    lastDebounce = now;
+    lastReading = pressed;
   }
+  if ((now - lastDebounce) < DEBOUNCE_MS)
+    return false;
+
+  // press detected
+  if (pressed && !buttonPressed)
+  {
+    buttonPressed = true;
+    buttonPressStart = now;
+  }
+
+  // release detected
+  if (!pressed && buttonPressed)
+  {
+    buttonPressed = false;
+    return true;
+  }
+
+  return false;
 }
 
-
-// ---------- PLAYBACK STATE MONITOR ----------
-void updatePlaybackState()
+// ---------- FSM Update ----------
+void fsmUpdate()
 {
-  static unsigned long playStart = 0; // when playback (intro or clip) began
+  unsigned long now = millis();
 
-  // Handle playback (intro + normal)
-  if (currentState == STATE_PLAYING || currentState == STATE_INTRO)
+  switch (currentState)
   {
-    // Record the moment playback started
+  case STATE_INTRO:
+    analogWrite(LED_PIN, 255);
+    // Transition automatically to idle once intro finishes
     if (playStart == 0)
-      playStart = millis();
+      playStart = now;
 
-    // Give DFPlayer time to assert BUSY low (about 500 ms)
-    if (millis() - playStart < 500)
-      return;
-
-    // After settle period, check if playback finished (BUSY goes high again)
-    if (digitalRead(DFPLAYER_BUSY) == HIGH)
+    if ((now - playStart) > 500 && digitalRead(DFPLAYER_BUSY) == HIGH)
     {
       currentState = STATE_IDLE;
-      analogWrite(LED_PIN, 0); // ensure LED off at end of clip
-      playStart = 0;           // reset timer for next playback
+      playStart = 0;
     }
-  }
-  else
-  {
-    playStart = 0; // reset timer when not in a playing/intro state
+    break;
+
+  case STATE_IDLE:
+    analogWrite(LED_PIN, 0);
+
+    // Enter volume mode on long press
+    if (buttonPressed && (now - buttonPressStart >= LONG_PRESS_MS))
+    {
+      currentState = STATE_VOLUME;
+      lastVolumeAction = now;
+      return;
+    }
+
+    // Short press → play random clip
+    if (updateButton())
+    {
+      // Seed random every time (or just once if using seededRandom flag)
+      randomSeed(now); // <-- you could remove seededRandom logic if you want
+
+      if (digitalRead(DFPLAYER_BUSY) == HIGH)
+      {
+        playRandomClip();
+        currentState = STATE_PLAYING;
+        playStart = now;
+      }
+    }
+    break;
+
+  case STATE_PLAYING:
+    analogWrite(LED_PIN, 255);
+    // wait until DFPlayer finishes
+    if (digitalRead(DFPLAYER_BUSY) == HIGH && playStart != 0 && (now - playStart) > 500)
+    {
+      currentState = STATE_IDLE;
+      playStart = 0;
+    }
+    break;
+
+  case STATE_VOLUME:
+    analogWrite(LED_PIN, map(volume, 0, MAX_VOLUME, 0, 255));
+
+    // handle timeout back to idle
+    if (now - lastVolumeAction > VOLUME_TIMEOUT)
+    {
+      rememberVolume(volume);
+      currentState = STATE_IDLE;
+      return;
+    }
+
+    if (updateButton())
+    {
+      volume += VOLUME_STEP;
+      if (volume > MAX_VOLUME)
+        volume = 0;
+      setVolume(volume);
+      lastVolumeAction = now;
+    }
+    break;
+
+  default:
+    currentState = STATE_IDLE;
+    break;
   }
 }
-
 
 // ---------- Setup ----------
 void setup()
@@ -149,117 +221,18 @@ void setup()
   pinMode(LED_PIN, OUTPUT);
   analogWrite(LED_PIN, 0);
 
-  // Give DFPlayer extra time to boot and mount SD
   delay(500);
 
-  // Set volume and play intro
   volume = readSavedVolume();
   setVolume(volume);
   delay(200);
 
-  playTrack(1);
-  delay(200);
+  playTrack(INTRO_TRACK);
+  playStart = 0;
 }
-// ---------- Input Handling ----------
-void updateButton()
-{
-  bool pressed = (digitalRead(BUTTON_PIN) == LOW);
-  unsigned long now = millis();
-
-  // --- debounce ---
-  static bool lastReading = HIGH;
-  static unsigned long lastDebounce = 0;
-  if (pressed != lastReading)
-  {
-    lastDebounce = now;
-    lastReading = pressed;
-  }
-  if ((now - lastDebounce) < DEBOUNCE_MS)
-    return; // still bouncing
-
-  // --- press detected ---
-  if (pressed && !buttonPressed)
-  {
-    buttonPressed = true;
-    buttonPressStart = now;
-  }
-
-  // --- held long enough → enter VOLUME_CHANGE ---
-  if (buttonPressed && (currentState != STATE_VOLUME) &&
-      (now - buttonPressStart >= LONG_PRESS_MS))
-  {
-    currentState = STATE_VOLUME;
-    lastVolumeAction = now;
-    return;
-  }
-
-  // --- release detected ---
-  if (!pressed && buttonPressed)
-  {
-    buttonPressed = false;
-
-    switch (currentState)
-    {
-    case STATE_IDLE:
-      // short press → play clip *only if DFPlayer not busy*
-      if (digitalRead(DFPLAYER_BUSY) == HIGH)
-      {
-        playRandomClip();
-
-        currentState = STATE_PLAYING;
-      }
-
-      break;
-
-    case STATE_VOLUME:
-      volume += VOLUME_STEP;
-      if (volume > 30)
-        volume = 0;
-      setVolume(volume);
-      lastVolumeAction = now;
-      break;
-
-    default:
-      break;
-    }
-  }
-}
-
-// ---------- LED Control ----------
-void updateLED()
-{
-  switch (currentState)
-  {
-  case STATE_INTRO:
-    analogWrite(LED_PIN, 255);
-    break;
-  case STATE_PLAYING:
-    analogWrite(LED_PIN, 255);
-    break;
-  case STATE_IDLE:
-    analogWrite(LED_PIN, 0);
-    break;
-  case STATE_VOLUME:
-    //   analogWrite(LED_PIN, ((now / 300) % 2) ? 255 : 0);  // Blink LED while adjusting volume
-    //   targetBrightness = map(volume, 0, 30, 0, 255); // brightness based on volume
-    if (volume == 0)
-    {
-      analogWrite(LED_PIN, 20);
-    }
-    else
-    {
-      analogWrite(LED_PIN, map(volume, 0, 30, 0, 255));
-      break;
-    }
-  }
-}
-
 
 // ---------- Main Loop ----------
 void loop()
 {
-  updateButton();
-  handleVolumeTimeout();
-  updatePlaybackState();
-  updateLED();
+  fsmUpdate();
 }
